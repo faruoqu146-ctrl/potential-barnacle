@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""
+=============================================================================
+Cancer Mutation × Treatment Response Correlation Pipeline
+Data source: cBioPortal (https://www.cbioportal.org)
+=============================================================================
+
+INSTALL DEPENDENCIES:
+    pip install requests pandas numpy scipy matplotlib seaborn tqdm
+
+RUN:
+    python cancer_correlation_pipeline.py
+
+OUTPUTS:
+    ./results/
+        mutations_summary.csv         - Top mutated genes per cancer type
+        treatment_correlations.csv    - Mutation vs response correlations
+        survival_correlations.csv     - Mutation vs OS/PFS correlations
+        cross_cancer_heatmap.png      - Mutation frequency heatmap
+        top_correlations.png          - Top mutation-response associations
+        volcano_plot.png              - Statistical significance plot
+        per_study_results/            - Per-study detailed outputs
+"""
+
+import os
+import sys
+import json
+import time
+import logging
+import requests
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import seaborn as sns
+from tqdm import tqdm
+from scipy import stats
+from scipy.stats import fisher_exact, chi2_contingency
+from collections import defaultdict
+
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+
+BASE_URL = "https://www.cbioportal.org/api"
+RESULTS_DIR = "./results"
+PER_STUDY_DIR = f"{RESULTS_DIR}/per_study_results"
+
+# How many top genes to analyze per study
+TOP_GENES = 50
+
+# Minimum samples a study must have to be included
+MIN_SAMPLES = 100
+
+# Studies to skip (very large ones slow things down; remove to include all)
+SKIP_STUDIES = []
+
+# If True, only run on a small subset for testing
+TEST_MODE = False
+TEST_STUDIES = 5
+
+# Rate limiting (seconds between requests)
+REQUEST_DELAY = 0.1
+
+# ─── LOGGING ─────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(f"{RESULTS_DIR}/pipeline.log") if os.path.exists(RESULTS_DIR) else logging.StreamHandler(),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger(__name__)
+
+# ─── API HELPERS ─────────────────────────────────────────────────────────────
+
+session = requests.Session()
+session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
+
+def api_get(endpoint, params=None, retries=3):
+    url = f"{BASE_URL}{endpoint}"
+    for attempt in range(retries):
+        try:
+            r = session.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            time.sleep(REQUEST_DELAY)
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            if attempt == retries - 1:
+                log.warning(f"GET {endpoint} failed after {retries} attempts: {e}")
+                return None
+            time.sleep(2 ** attempt)
+
+def api_post(endpoint, payload, retries=3):
+    url = f"{BASE_URL}{endpoint}"
+    for attempt in range(retries):
+        try:
+            r = session.post(url, json=payload, timeout=60)
+            r.raise_for_status()
+            time.sleep(REQUEST_DELAY)
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            if attempt == retries - 1:
+                log.warning(f"POST {endpoint} failed: {e}")
+                return None
+            time.sleep(2 ** attempt)
+
+# ─── DATA FETCHING ────────────────────────────────────────────────────────────
+
+def get_all_studies():
+    log.info("Fetching all studies from cBioPortal...")
+    studies = api_get("/studies", params={"pageSize": 10000})
+    if not studies:
+        log.error("Could not fetch studies. Check your internet connection.")
+        sys.exit(1)
+    log.info(f"Found {len(studies)} studies")
+    return studies
+
+def get_cancer_types():
+    types = api_get("/cancer-types", params={"pageSize": 1000})
+    return {t["cancerTypeId"]: t["name"] for t in (types or [])}
+
+def get_molecular_profiles(study_id):
+    profiles = api_get(f"/studies/{study_id}/molecular-profiles")
+    if not profiles:
+        return None, None
+    mut_profile = next((p for p in profiles if p.get("molecularAlterationType") == "MUTATION_EXTENDED"), None)
+    return mut_profile
+
+def get_sample_list(study_id):
+    lists = api_get(f"/studies/{study_id}/sample-lists")
+    if not lists:
+        return None
+    all_list = next((l for l in lists if l.get("sampleListId", "").endswith("_all")), None)
+    return all_list
+
+def get_samples(study_id):
+    samples = api_get(f"/studies/{study_id}/samples", params={"pageSize": 50000})
+    return [s["sampleId"] for s in (samples or [])]
+
+def get_mutations(molecular_profile_id, sample_ids, gene_limit=TOP_GENES):
+    """Fetch mutations for samples; returns DataFrame with sampleId, hugoGeneSymbol, mutationType"""
+    payload = {
+        "sampleIds": sample_ids,
+        "projection": "SUMMARY"
+    }
+    mutations = api_post(f"/molecular-profiles/{molecular_profile_id}/mutations/fetch?pageSize=500000", payload)
+    if not mutations:
+        return pd.DataFrame()
+    df = pd.DataFrame(mutations)
+    if df.empty:
+        return df
+    cols = [c for c in ["sampleId", "patientId", "gene", "mutationType", "proteinChange", "chr", "startPosition"] if c in df.columns]
+    df = df[cols] if cols else df
+    # Flatten gene symbol
+    if "gene" in df.columns:
+        df["hugoGeneSymbol"] = df["gene"].apply(lambda x: x.get("hugoGeneSymbol") if isinstance(x, dict) else x)
+    return df
+
+def get_clinical_data(study_id, attribute_ids=None):
+    """Fetch clinical data; returns DataFrame with sampleId + attribute columns"""
+    params = {"pageSize": 100000, "clinicalDataType": "SAMPLE"}
+    data = api_get(f"/studies/{study_id}/clinical-data", params=params)
+    if not data:
+        # try patient level
+        params["clinicalDataType"] = "PATIENT"
+        data = api_get(f"/studies/{study_id}/clinical-data", params=params)
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    id_col = "sampleId" if "sampleId" in df.columns else "patientId"
+    if "clinicalAttributeId" not in df.columns or "value" not in df.columns:
+        return df
+    pivot = df.pivot_table(index=id_col, columns="clinicalAttributeId", values="value", aggfunc="first")
+    pivot.reset_index(inplace=True)
+    return pivot
+
+def get_clinical_attributes(study_id):
+    attrs = api_get(f"/studies/{study_id}/clinical-attributes")
+    return attrs or []
+
+# ─── ANALYSIS ────────────────────────────────────────────────────────────────
+
+RESPONSE_KEYWORDS = [
+    "RESPONSE", "BEST_RESPONSE", "RECIST", "TREATMENT_RESPONSE",
+    "DRUG_RESPONSE", "THERAPY_RESPONSE", "CHEMOTHERAPY_RESPONSE"
+]
+SURVIVAL_KEYWORDS = ["OS_STATUS", "OS_MONTHS", "PFS_STATUS", "PFS_MONTHS", "DFS_STATUS", "DSS_STATUS"]
+STAGE_KEYWORDS = ["STAGE", "TUMOR_STAGE", "CLINICAL_STAGE", "PATHOLOGICAL_STAGE"]
+
+def find_response_columns(columns):
+    cols = [str(c).upper() for c in columns]
+    response_cols = [c for c in cols if any(k in c for k in RESPONSE_KEYWORDS)]
+    survival_cols = [c for c in cols if any(k in c for k in SURVIVAL_KEYWORDS)]
+    return response_cols, survival_cols
+
+def mutation_binary_matrix(mutation_df, sample_ids, top_genes=None):
+    """Create a binary (sample x gene) mutation matrix"""
+    if mutation_df.empty or "hugoGeneSymbol" not in mutation_df.columns:
+        return pd.DataFrame()
+    if top_genes is None:
+        gene_counts = mutation_df["hugoGeneSymbol"].value_counts()
+        top_genes = gene_counts.head(TOP_GENES).index.tolist()
+    mut_matrix = mutation_df[mutation_df["hugoGeneSymbol"].isin(top_genes)].copy()
+    id_col = "sampleId" if "sampleId" in mut_matrix.columns else "patientId"
+    if id_col not in mut_matrix.columns:
+        return pd.DataFrame()
+    mut_matrix["mutated"] = 1
+    pivot = mut_matrix.pivot_table(index=id_col, columns="hugoGeneSymbol", values="mutated", aggfunc="max", fill_value=0)
+    # Add unmutated samples
+    all_samples = pd.DataFrame(index=sample_ids)
+    all_samples.index.name = id_col
+    pivot = pivot.reindex(all_samples.index, fill_value=0)
+    return pivot
+
+def correlate_mutation_response(mut_matrix, clinical_df, response_col, id_col="sampleId"):
+    """Fisher's exact test: mutated vs non-mutated × response vs no-response"""
+    results = []
+    if mut_matrix.empty or clinical_df.empty:
+        return pd.DataFrame()
+    if id_col not in clinical_df.columns:
+        return pd.DataFrame()
+    clinical_sub = clinical_df[[id_col, response_col]].copy()
+    clinical_sub[response_col] = clinical_sub[response_col].astype(str).str.upper()
+    # Binarize response: CR/PR/SD = responder variations; PD = non-responder
+    responder_terms = ["CR", "PR", "COMPLETE", "PARTIAL", "RESPONSE", "RESPONSIVE", "SENSITIVE", "YES", "1", "TRUE"]
+    clinical_sub["responder"] = clinical_sub[response_col].apply(
+        lambda x: 1 if any(t in x for t in responder_terms) else (0 if x not in ["", "NAN", "NA", "N/A", "UNKNOWN"] else np.nan)
+    )
+    clinical_sub = clinical_sub.dropna(subset=["responder"])
+    if len(clinical_sub) < 10:
+        return pd.DataFrame()
+    # Merge with mutation matrix
+    merged = mut_matrix.reset_index().merge(clinical_sub[[id_col, "responder"]], on=id_col, how="inner")
+    if merged.empty:
+        return pd.DataFrame()
+    for gene in mut_matrix.columns:
+        if gene not in merged.columns:
+            continue
+        mutated = merged[gene] == 1
+        responder = merged["responder"] == 1
+        # 2x2 contingency table
+        tp = (mutated & responder).sum()
+        fp = (mutated & ~responder).sum()
+        fn = (~mutated & responder).sum()
+        tn = (~mutated & ~responder).sum()
+        contingency = [[tp, fp], [fn, tn]]
+        try:
+            odds_ratio, p_value = fisher_exact(contingency, alternative="two-sided")
+        except Exception:
+            continue
+        mut_response_rate = tp / (tp + fp) if (tp + fp) > 0 else np.nan
+        wt_response_rate = fn / (fn + tn) if (fn + tn) > 0 else np.nan
+        results.append({
+            "gene": gene,
+            "response_attribute": response_col,
+            "n_mutated": tp + fp,
+            "n_wildtype": fn + tn,
+            "mut_response_rate": round(mut_response_rate, 4) if not np.isnan(mut_response_rate) else np.nan,
+            "wt_response_rate": round(wt_response_rate, 4) if not np.isnan(wt_response_rate) else np.nan,
+            "odds_ratio": round(odds_ratio, 4),
+            "p_value": p_value,
+            "contingency_table": str(contingency)
+        })
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df["p_adj_fdr"] = fdr_correction(df["p_value"].values)
+        df = df.sort_values("p_value")
+    return df
+
+def correlate_mutation_survival(mut_matrix, clinical_df, os_col, time_col=None, id_col="sampleId"):
+    """Log-rank test: mutated vs non-mutated survival"""
+    results = []
+    if mut_matrix.empty or clinical_df.empty:
+        return pd.DataFrame()
+    if id_col not in clinical_df.columns or os_col not in clinical_df.columns:
+        return pd.DataFrame()
+    clinical_sub = clinical_df[[id_col, os_col]].copy()
+    if time_col and time_col in clinical_df.columns:
+        clinical_sub[time_col] = pd.to_numeric(clinical_df[time_col], errors="coerce")
+    clinical_sub[os_col] = clinical_sub[os_col].astype(str).str.upper()
+    # Binarize: DECEASED/1/YES = event
+    event_terms = ["DECEASED", "DEAD", "YES", "1", "TRUE", "PROGRESSION", "RECURRED"]
+    clinical_sub["event"] = clinical_sub[os_col].apply(
+        lambda x: 1 if any(t in x for t in event_terms) else 0
+    )
+    merged = mut_matrix.reset_index().merge(clinical_sub, on=id_col, how="inner")
+    if merged.empty:
+        return pd.DataFrame()
+    for gene in mut_matrix.columns:
+        if gene not in merged.columns:
+            continue
+        mut_group = merged[merged[gene] == 1]["event"]
+        wt_group = merged[merged[gene] == 0]["event"]
+        if len(mut_group) < 5 or len(wt_group) < 5:
+            continue
+        # Chi-square as proxy for log-rank when time data unavailable
+        try:
+            contingency = pd.crosstab(merged[gene], merged["event"])
+            if contingency.shape == (2, 2):
+                chi2, p_value, dof, _ = chi2_contingency(contingency)
+            else:
+                continue
+        except Exception:
+            continue
+        results.append({
+            "gene": gene,
+            "survival_attribute": os_col,
+            "n_mutated": len(mut_group),
+            "n_wildtype": len(wt_group),
+            "mut_event_rate": round(mut_group.mean(), 4),
+            "wt_event_rate": round(wt_group.mean(), 4),
+            "chi2_statistic": round(chi2, 4),
+            "p_value": p_value
+        })
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df["p_adj_fdr"] = fdr_correction(df["p_value"].values)
+        df = df.sort_values("p_value")
+    return df
+
+def fdr_correction(p_values):
+    """Benjamini-Hochberg FDR correction"""
+    n = len(p_values)
+    if n == 0:
+        return np.array([])
+    sorted_idx = np.argsort(p_values)
+    sorted_p = np.array(p_values)[sorted_idx]
+    adj = np.minimum(1, sorted_p * n / (np.arange(n) + 1))
+    # Make monotone
+    for i in range(n - 2, -1, -1):
+        adj[i] = min(adj[i], adj[i + 1])
+    result = np.empty(n)
+    result[sorted_idx] = adj
+    return result
+
+# ─── VISUALIZATION ────────────────────────────────────────────────────────────
+
+def plot_cross_cancer_heatmap(mutation_freq_df, output_path):
+    """Heatmap of top gene mutation frequencies across cancer types"""
+    if mutation_freq_df.empty:
+        return
+    plt.figure(figsize=(22, 14))
+    # Pivot: genes × cancer types
+    pivot = mutation_freq_df.pivot_table(index="gene", columns="cancer_type_short", values="mutation_freq", aggfunc="mean")
+    pivot = pivot.fillna(0)
+    # Select top genes by max frequency
+    pivot = pivot.loc[pivot.max(axis=1).nlargest(40).index]
+    pivot = pivot[pivot.sum().nlargest(30).index]
+    sns.heatmap(
+        pivot,
+        cmap="YlOrRd",
+        linewidths=0.3,
+        linecolor="#1a1a2e",
+        annot=False,
+        cbar_kws={"label": "Mutation Frequency (%)"}
+    )
+    plt.title("Cross-Cancer Somatic Mutation Frequency Landscape\n(Top Genes × Cancer Types)", 
+              fontsize=16, fontweight="bold", pad=20)
+    plt.xlabel("Cancer Type", fontsize=12)
+    plt.ylabel("Gene", fontsize=12)
+    plt.xticks(rotation=45, ha="right", fontsize=8)
+    plt.yticks(fontsize=9)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="#0d0d1a")
+    plt.close()
+    log.info(f"Saved heatmap → {output_path}")
+
+def plot_top_correlations(corr_df, output_path, title="Top Mutation-Response Correlations"):
+    """Horizontal bar chart of top significant correlations"""
+    if corr_df.empty:
+        return
+    sig = corr_df[corr_df["p_adj_fdr"] < 0.1].copy() if "p_adj_fdr" in corr_df.columns else corr_df.copy()
+    if sig.empty:
+        sig = corr_df.head(30)
+    sig = sig.head(30)
+    if "odds_ratio" in sig.columns:
+        sig["log_or"] = np.log2(sig["odds_ratio"].clip(0.01, 100))
+        x_col, xlabel = "log_or", "log2(Odds Ratio)"
+    else:
+        sig["neg_log_p"] = -np.log10(sig["p_value"].clip(1e-300))
+        x_col, xlabel = "neg_log_p", "-log10(p-value)"
+    colors = ["#e74c3c" if v > 0 else "#3498db" for v in sig[x_col]]
+    fig, ax = plt.subplots(figsize=(12, max(6, len(sig) * 0.4)))
+    ax.barh(range(len(sig)), sig[x_col], color=colors, alpha=0.85, edgecolor="white", linewidth=0.5)
+    labels = sig["gene"] if "gene" in sig.columns else sig.index
+    ax.set_yticks(range(len(sig)))
+    ax.set_yticklabels(labels, fontsize=10)
+    ax.axvline(0, color="white", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_facecolor("#0d0d1a")
+    fig.patch.set_facecolor("#0d0d1a")
+    ax.tick_params(colors="white")
+    ax.xaxis.label.set_color("white")
+    ax.title.set_color("white")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333355")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="#0d0d1a")
+    plt.close()
+    log.info(f"Saved correlation chart → {output_path}")
+
+def plot_volcano(corr_df, output_path):
+    """Volcano plot: effect size vs significance"""
+    if corr_df.empty or "p_value" not in corr_df.columns:
+        return
+    df = corr_df.copy()
+    df = df.dropna(subset=["p_value"])
+    df["neg_log_p"] = -np.log10(df["p_value"].clip(1e-300))
+    x_col = "log_or" if "log_or" in df.columns else ("odds_ratio" if "odds_ratio" in df.columns else None)
+    if x_col == "odds_ratio":
+        df["log_or"] = np.log2(df["odds_ratio"].clip(0.01, 100))
+        x_col = "log_or"
+    if x_col is None:
+        return
+    threshold_p = 0.05
+    threshold_or = 1.0
+    colors = []
+    for _, row in df.iterrows():
+        if row["neg_log_p"] > -np.log10(threshold_p) and row[x_col] > threshold_or:
+            colors.append("#e74c3c")  # significant positive
+        elif row["neg_log_p"] > -np.log10(threshold_p) and row[x_col] < -threshold_or:
+            colors.append("#3498db")  # significant negative
+        else:
+            colors.append("#555577")  # not significant
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.scatter(df[x_col], df["neg_log_p"], c=colors, alpha=0.7, s=40, edgecolors="none")
+    ax.axhline(-np.log10(threshold_p), color="#aaaacc", linewidth=1, linestyle="--", alpha=0.7, label="p=0.05")
+    ax.axvline(threshold_or, color="#aaaacc", linewidth=1, linestyle="--", alpha=0.4)
+    ax.axvline(-threshold_or, color="#aaaacc", linewidth=1, linestyle="--", alpha=0.4)
+    # Label top hits
+    top = df.nlargest(15, "neg_log_p")
+    for _, row in top.iterrows():
+        gene = row.get("gene", "")
+        ax.annotate(gene, (row[x_col], row["neg_log_p"]), fontsize=7, color="white",
+                    xytext=(4, 4), textcoords="offset points", alpha=0.9)
+    ax.set_xlabel("log2(Odds Ratio)  [Mutated vs WT response]", fontsize=11)
+    ax.set_ylabel("-log10(p-value)", fontsize=11)
+    ax.set_title("Volcano Plot: Mutation-Treatment Response Associations", fontsize=13, fontweight="bold")
+    ax.set_facecolor("#0d0d1a")
+    fig.patch.set_facecolor("#0d0d1a")
+    ax.tick_params(colors="white")
+    ax.xaxis.label.set_color("white")
+    ax.yaxis.label.set_color("white")
+    ax.title.set_color("white")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333355")
+    ax.legend(facecolor="#1a1a2e", edgecolor="#333355", labelcolor="white")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="#0d0d1a")
+    plt.close()
+    log.info(f"Saved volcano plot → {output_path}")
+
+# ─── MAIN PIPELINE ────────────────────────────────────────────────────────────
+
+def main():
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(PER_STUDY_DIR, exist_ok=True)
+
+    # Re-init logging with file handler
+    file_handler = logging.FileHandler(f"{RESULTS_DIR}/pipeline.log")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(file_handler)
+
+    log.info("=" * 70)
+    log.info("CANCER MUTATION × TREATMENT RESPONSE CORRELATION PIPELINE")
+    log.info("=" * 70)
+
+    # 1. Fetch metadata
+    studies = get_all_studies()
+    cancer_types = get_cancer_types()
+
+    if TEST_MODE:
+        studies = studies[:TEST_STUDIES]
+        log.info(f"TEST MODE: running on {TEST_STUDIES} studies only")
+
+    # Filter studies
+    studies = [s for s in studies if s.get("studyId") not in SKIP_STUDIES]
+    studies = [s for s in studies if s.get("allSampleCount", 0) >= MIN_SAMPLES]
+    log.info(f"After filtering: {len(studies)} studies with >= {MIN_SAMPLES} samples")
+
+    # 2. Process each study
+    all_mutation_freqs = []
+    all_response_corrs = []
+    all_survival_corrs = []
+
+    for study in tqdm(studies, desc="Processing studies"):
+        study_id = study["studyId"]
+        cancer_id = study.get("cancerTypeId", "unknown")
+        cancer_name = cancer_types.get(cancer_id, cancer_id)
+        n_samples = study.get("allSampleCount", 0)
+
+        log.info(f"\n{'─'*50}")
+        log.info(f"Study: {study_id}  |  {cancer_name}  |  n={n_samples}")
+
+        try:
+            # Get mutation profile
+            mut_profile = get_molecular_profiles(study_id)
+            if not mut_profile:
+                log.info(f"  No mutation profile → skipping")
+                continue
+
+            # Get samples
+            sample_ids = get_samples(study_id)
+            if not sample_ids:
+                log.info(f"  No samples → skipping")
+                continue
+
+            # Get clinical data
+            clinical_df = get_clinical_data(study_id)
+
+            # Get mutations
+            mutations_df = get_mutations(mut_profile["molecularProfileId"], sample_ids)
+            if mutations_df.empty:
+                log.info(f"  No mutations → skipping")
+                continue
+
+            # Compute mutation frequencies
+            gene_counts = mutations_df["hugoGeneSymbol"].value_counts() if "hugoGeneSymbol" in mutations_df.columns else pd.Series()
+            top_genes = gene_counts.head(TOP_GENES).index.tolist()
+            for gene, count in gene_counts.head(TOP_GENES).items():
+                all_mutation_freqs.append({
+                    "study_id": study_id,
+                    "cancer_type": cancer_name,
+                    "cancer_type_short": cancer_id.upper()[:10],
+                    "gene": gene,
+                    "n_mutated": count,
+                    "n_samples": n_samples,
+                    "mutation_freq": round(count / n_samples * 100, 2)
+                })
+
+            log.info(f"  Top mutated genes: {', '.join(top_genes[:10])}")
+
+            # Build mutation matrix
+            id_col = "sampleId" if "sampleId" in mutations_df.columns else "patientId"
+            mut_matrix = mutation_binary_matrix(mutations_df, sample_ids, top_genes)
+
+            if clinical_df.empty:
+                log.info(f"  No clinical data → skipping correlations")
+                continue
+
+            # Find response/survival columns
+            response_cols, survival_cols = find_response_columns(clinical_df.columns.tolist())
+            log.info(f"  Response cols: {response_cols[:5]}  |  Survival cols: {survival_cols[:5]}")
+
+            # Correlate with treatment response
+            for resp_col in response_cols[:3]:  # limit to first 3
+                if resp_col not in clinical_df.columns:
+                    continue
+                corr_df = correlate_mutation_response(mut_matrix, clinical_df, resp_col, id_col=id_col)
+                if not corr_df.empty:
+                    corr_df["study_id"] = study_id
+                    corr_df["cancer_type"] = cancer_name
+                    corr_df["n_samples"] = n_samples
+                    all_response_corrs.append(corr_df)
+                    log.info(f"  Response correlations ({resp_col}): {len(corr_df)} genes, "
+                             f"{(corr_df['p_value'] < 0.05).sum()} significant")
+
+            # Correlate with survival
+            for surv_col in survival_cols[:3]:
+                if surv_col not in clinical_df.columns:
+                    continue
+                surv_df = correlate_mutation_survival(mut_matrix, clinical_df, surv_col, id_col=id_col)
+                if not surv_df.empty:
+                    surv_df["study_id"] = study_id
+                    surv_df["cancer_type"] = cancer_name
+                    all_survival_corrs.append(surv_df)
+                    log.info(f"  Survival correlations ({surv_col}): {len(surv_df)} genes")
+
+            # Save per-study output
+            study_out = f"{PER_STUDY_DIR}/{study_id}"
+            os.makedirs(study_out, exist_ok=True)
+            if not mut_matrix.empty:
+                mut_matrix.to_csv(f"{study_out}/mutation_matrix.csv")
+            if all_response_corrs:
+                all_response_corrs[-1].to_csv(f"{study_out}/response_correlations.csv", index=False)
+
+        except Exception as e:
+            log.error(f"  Error processing {study_id}: {e}", exc_info=False)
+            continue
+
+    # 3. Aggregate results
+    log.info("\n" + "=" * 70)
+    log.info("AGGREGATING RESULTS")
+    log.info("=" * 70)
+
+    freq_df = pd.DataFrame(all_mutation_freqs)
+    if not freq_df.empty:
+        freq_df.to_csv(f"{RESULTS_DIR}/mutations_summary.csv", index=False)
+        log.info(f"Mutation summary: {len(freq_df)} records across {freq_df['study_id'].nunique()} studies")
+
+    if all_response_corrs:
+        response_df = pd.concat(all_response_corrs, ignore_index=True)
+        response_df = response_df.sort_values("p_value")
+        response_df.to_csv(f"{RESULTS_DIR}/treatment_correlations.csv", index=False)
+        n_sig = (response_df["p_value"] < 0.05).sum()
+        log.info(f"Treatment correlations: {len(response_df)} total, {n_sig} significant (p<0.05)")
+        top10 = response_df.head(10)[["gene", "cancer_type", "response_attribute", "odds_ratio", "p_value", "mut_response_rate", "wt_response_rate"]]
+        log.info(f"\nTop 10 mutation-response associations:\n{top10.to_string()}")
+
+    if all_survival_corrs:
+        survival_df = pd.concat(all_survival_corrs, ignore_index=True)
+        survival_df.to_csv(f"{RESULTS_DIR}/survival_correlations.csv", index=False)
+        log.info(f"Survival correlations: {len(survival_df)} total")
+
+    # 4. Plots
+    log.info("\nGenerating plots...")
+
+    if not freq_df.empty:
+        plot_cross_cancer_heatmap(freq_df, f"{RESULTS_DIR}/cross_cancer_heatmap.png")
+
+    if all_response_corrs:
+        combined = pd.concat(all_response_corrs, ignore_index=True)
+        combined["log_or"] = np.log2(combined["odds_ratio"].clip(0.01, 100))
+        plot_top_correlations(combined.head(50), f"{RESULTS_DIR}/top_correlations.png",
+                              "Top Mutation × Treatment Response Associations (All Cancers)")
+        plot_volcano(combined, f"{RESULTS_DIR}/volcano_plot.png")
+
+    log.info("\n" + "=" * 70)
+    log.info("PIPELINE COMPLETE")
+    log.info(f"All outputs saved to: {os.path.abspath(RESULTS_DIR)}/")
+    log.info("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
